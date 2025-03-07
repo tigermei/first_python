@@ -104,6 +104,22 @@ def create_id_photo_yolo(input_image_path, output_image_path, background_color=(
     # 保存原始掩码用于后续处理
     original_mask = mask.copy()
     
+    # 增强对小异物的处理
+    # 使用形态学操作改善掩码，增加闭运算的迭代次数
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # 增大核大小
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)  # 增加迭代次数
+    
+    # 添加额外的噪点清除步骤
+    # 使用中值滤波去除小的噪点
+    mask = cv2.medianBlur(mask, 5)
+    
+    # 使用形态学操作改善掩码，增加闭运算的迭代次数
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    # 保存原始掩码用于后续处理
+    original_mask = mask.copy()
+    
     # 使用更精细的边缘处理技术，特别关注衣领区域
     # 1. 使用更小的结构元素创建精细边缘
     micro_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
@@ -152,12 +168,29 @@ def create_id_photo_yolo(input_image_path, output_image_path, background_color=(
     
     # 7. 对衣领区域进行额外的腐蚀处理，去除灰黑色线条
     # 创建衣领区域的腐蚀掩码
-    collar_erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    collar_eroded = cv2.erode(original_mask, collar_erode_kernel, iterations=1)
+    # 增加眼镜区域的特殊处理
+    # 使用边缘检测找到眼镜区域
+    glasses_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    glasses_edges = cv2.Canny(glasses_gray, 50, 150)
+    glasses_dilated = cv2.dilate(glasses_edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    glasses_region = np.zeros_like(mask, dtype=np.float32)
+    
+    # 假设眼镜在面部上半部分
+    face_top = y
+    face_bottom = y + h
+    glasses_y = face_top + int(h * 0.2)  # 大约在脸部上方20%处
+    glasses_height = int(h * 0.3)  # 大约占脸部高度的30%
+    glasses_region[glasses_y:glasses_y+glasses_height, x:x+w] = 1.0
+    glasses_region = glasses_region * cv2.GaussianBlur(glasses_dilated.astype(float) / 255.0, (5, 5), 1.0)
+    
+    # 创建衣领区域的腐蚀掩码 - 添加这一行来定义缺失的变量
+    collar_erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    collar_eroded = cv2.erode(original_mask, collar_erode_kernel, iterations=4)
+    
     # 只在衣领区域应用腐蚀
     collar_mask = collar_eroded * collar_region + original_mask * (1 - collar_region)
     # 平滑过渡
-    collar_mask = cv2.GaussianBlur(collar_mask, (5, 5), 1.0)
+    collar_mask = cv2.GaussianBlur(collar_mask, (9, 9), 2.0)  # 增强模糊效果
     # 更新主体掩码
     smooth_mask = smooth_mask * (1 - collar_region) + collar_mask * collar_region
     
@@ -169,7 +202,7 @@ def create_id_photo_yolo(input_image_path, output_image_path, background_color=(
     edge_mask_3channel = np.stack([edge_mask, edge_mask, edge_mask], axis=2)
     
     # 8. 使用更多级别的透明度，特别关注衣领区域
-    alpha_levels = [0.98, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]  # 增加级别数量和起始透明度
+    alpha_levels = [0.98, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.5, 0.4, 0.3]  # 增加更多级别
     edge_blend_total = np.zeros_like(img, dtype=np.float32)
     
     # 为每个透明度级别创建非常窄的边缘区域
@@ -225,13 +258,47 @@ def create_id_photo_yolo(input_image_path, output_image_path, background_color=(
     collar_blur_mask_3ch = np.stack([collar_blur_mask, collar_blur_mask, collar_blur_mask], axis=2)
     
     # 对衣领区域应用更强的模糊
-    collar_blurred = cv2.GaussianBlur(result, (5, 5), 1.0)
-    result = result * (1 - collar_blur_mask_3ch * 0.3) + collar_blurred * (collar_blur_mask_3ch * 0.3)
+    collar_blurred = cv2.GaussianBlur(result, (7, 7), 1.5)  # 增强模糊效果
+    result = result * (1 - collar_blur_mask_3ch * 0.5) + collar_blurred * (collar_blur_mask_3ch * 0.5)  # 增加模糊权重
+    
+    # 额外的背景清理步骤
+    # 创建更严格的掩码用于最终清理
+    final_mask = cv2.erode(original_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=2)
+    final_mask = cv2.GaussianBlur(final_mask.astype(float), (7, 7), 1.5)
+    final_mask_3ch = np.stack([final_mask, final_mask, final_mask], axis=2)
+    
+    # 应用最终掩码，确保背景区域完全是纯色
+    pure_background = np.ones_like(img) * np.array(background_color, dtype=np.uint8)
+    result = result * final_mask_3ch + pure_background * (1 - final_mask_3ch)
+    
+    # 额外的边缘清理步骤
+    # 创建边缘检测掩码
+    # ... existing code ...
+    
+    # 修改边缘处理，特别关注问题区域
+    # 增强边缘检测的参数
+    edge_detect = cv2.Canny(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 50, 150)  # 降低阈值以捕获更多边缘
+    edge_detect = cv2.dilate(edge_detect, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=2)  # 增加膨胀强度
+    edge_detect = cv2.GaussianBlur(edge_detect.astype(float), (7, 7), 2.0) / 255.0  # 增强模糊效果
+    
+    # 将边缘检测掩码转换为3通道
+    edge_detect_3ch = np.stack([edge_detect, edge_detect, edge_detect], axis=2)
+    
+    # 在边缘区域应用更强的背景混合
+    edge_blend_factor = 0.85  # 增加边缘区域的背景混合因子
+    edge_result = result * (1 - edge_detect_3ch * edge_blend_factor) + pure_background * (edge_detect_3ch * edge_blend_factor)
+    
+    # 只在原始掩码外部应用边缘清理
+    outside_mask = 1 - cv2.dilate(original_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+    outside_mask = cv2.GaussianBlur(outside_mask.astype(float), (5, 5), 1.0)
+    outside_mask_3ch = np.stack([outside_mask, outside_mask, outside_mask], axis=2)
+    
+    result = result * (1 - outside_mask_3ch) + edge_result * outside_mask_3ch
     result = np.clip(result, 0, 255).astype(np.uint8)
     
-    # 调整为2寸证件照尺寸 (35mm x 45mm，约413 x 531像素，按照300dpi计算)
-    id_photo_width = 413
-    id_photo_height = 531
+    # 调整为1寸证件照尺寸 (25mm x 35mm，约295 x 413像素，按照300dpi计算)
+    id_photo_width = 295
+    id_photo_height = 413
     
     # 计算裁剪区域，使人脸居中
     face_center_x = x + w // 2
@@ -273,8 +340,8 @@ if __name__ == "__main__":
     else:
         # 生成输出路径
         filename, ext = os.path.splitext(os.path.basename(input_path))
-        output_path = os.path.join(os.path.dirname(input_path), f"{filename}_yolo_id_photo{ext}")
+        output_path = os.path.join(os.path.dirname(input_path), f"{filename}_yolo_1inch_id_photo{ext}")
         
-        # 创建证件照，使用红色背景
-        create_id_photo_yolo(input_path, output_path, background_color=(0, 0, 255))
+        # 创建证件照，使用蓝色背景
+        create_id_photo_yolo(input_path, output_path, background_color=(255, 0, 0))
         
